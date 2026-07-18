@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 import type { Document, Filter, Sort } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose-cjs";
+import Groq from "groq-sdk";
 
 dotenv.config();
 
@@ -120,8 +121,191 @@ interface ContactMessageInput {
   message: string;
 }
 
+type AIMessageRole = "user" | "assistant";
+
+interface AIMessageDocument {
+  id: string;
+  role: AIMessageRole;
+  content: string;
+  createdAt: Date;
+}
+
+interface AIChatInput {
+  conversationId?: string;
+  message: string;
+}
+
+interface AIConversationDocument {
+  _id?: ObjectId;
+  userId: string;
+  title: string;
+  messages: AIMessageDocument[];
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface AIStreamEvent {
+  type: "conversation" | "delta" | "done" | "error";
+  conversationId?: string;
+  content?: string;
+  suggestions?: string[];
+  message?: string;
+}
+
+const CAREER_PILOT_SYSTEM_PROMPT = `
+You are CareerPilot AI Assistant, an intelligent conversational assistant integrated into the CareerPilot job portal.
+
+CareerPilot routes:
+- / : Home page
+- /jobs : Explore all public jobs
+- /jobs/[id] : View a specific job
+- /jobs/add : Publish a new job
+- /jobs/manage : Manage the authenticated user's jobs
+- /dashboard : View job statistics and recent activity
+- /profile : View and edit profile information
+- /about : Learn about CareerPilot
+- /contact : Send a support or feedback message
+- /ai-assistant : CareerPilot AI Assistant
+
+CareerPilot job information may include:
+- Job title
+- Company name and logo
+- Job description
+- Category
+- Job type
+- Work mode
+- Location
+- Experience level
+- Salary range
+- Application deadline
+- Required skills
+
+Language and communication rules:
+1. Always reply in the same language and writing style used by the user.
+2. If the user writes English, reply in English.
+3. If the user writes Bengali using Bengali script, reply in Bengali script.
+4. If the user writes Bengali using English letters, reply in natural Roman Bangla using English letters.
+5. Do not mix Hindi, Urdu or other languages with Bengali.
+6. Do not use greetings such as "Namaste" unless the user uses that greeting first.
+7. For Roman Bangla, use natural Bangladeshi wording and spelling.
+8. Do not mention the user's name unless the user asks you to use it or it is necessary.
+9. Respond naturally to greetings without giving an unnecessarily long introduction.
+10. Keep simple answers concise. Give detailed explanations when the question requires them.
+
+Your responsibilities:
+1. Answer greetings and casual conversation naturally.
+2. Answer general knowledge, educational, technical and everyday questions.
+3. Answer career, job search, interview, skill and professional development questions.
+4. Help users understand and navigate CareerPilot.
+5. Explain how to explore, publish, edit and manage jobs.
+6. Use previous conversation messages to understand follow-up questions.
+7. Give clear, practical and accurate answers.
+8. Mention relevant CareerPilot routes when navigation help is useful.
+9. Never claim that you submitted an application, edited a job, deleted data or changed account information.
+10. Do not invent CareerPilot job listings, user information or application data.
+11. Clearly mention uncertainty when information requires current verification.
+12. Politely refuse harmful, illegal or unsafe requests.
+
+Response formatting rules:
+1. Use Markdown when it improves readability.
+2. Use short headings for long explanations.
+3. Use bullet points or numbered lists when appropriate.
+4. Put programming code inside fenced code blocks and include the language name.
+5. Do not use unnecessary headings for simple greetings or short answers.
+6. Do not overuse bold text, emojis or decorative symbols.
+`;
+
+function getGroqClient() {
+  const apiKey = process.env.GROQ_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("GROQ_API_KEY is not configured.");
+  }
+
+  return new Groq({
+    apiKey,
+  });
+}
+
+function createAIMessageId() {
+  return new ObjectId().toString();
+}
+
+function createConversationTitle(message: string) {
+  const normalizedMessage = message.replace(/\s+/g, " ").trim();
+
+  if (normalizedMessage.length <= 55) {
+    return normalizedMessage;
+  }
+
+  return `${normalizedMessage.slice(0, 52)}...`;
+}
+
 function escapeRegex(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getSuggestedPrompts(message: string) {
+  const normalizedMessage = message.toLowerCase();
+
+  if (
+    normalizedMessage.includes("publish") ||
+    normalizedMessage.includes("add job") ||
+    normalizedMessage.includes("post job")
+  ) {
+    return [
+      "What information is required to publish a job?",
+      "How can I edit a published job?",
+      "Where can I manage my jobs?",
+    ];
+  }
+
+  if (
+    normalizedMessage.includes("search") ||
+    normalizedMessage.includes("find") ||
+    normalizedMessage.includes("remote") ||
+    normalizedMessage.includes("job")
+  ) {
+    return [
+      "How do I use the job filters?",
+      "How can I view complete job details?",
+      "What should I check before applying?",
+    ];
+  }
+
+  if (
+    normalizedMessage.includes("profile") ||
+    normalizedMessage.includes("account")
+  ) {
+    return [
+      "How can I update my profile?",
+      "Can I change my profile image?",
+      "Where can I view my dashboard?",
+    ];
+  }
+
+  if (
+    normalizedMessage.includes("skill") ||
+    normalizedMessage.includes("career")
+  ) {
+    return [
+      "What skills should I learn next?",
+      "How can I choose a career path?",
+      "How should I prepare for an interview?",
+    ];
+  }
+
+  return [
+    "How do I explore jobs?",
+    "How can I publish a job?",
+    "Explain the CareerPilot dashboard",
+  ];
+}
+
+function writeAIStreamEvent(res: Response, event: AIStreamEvent) {
+  if (!res.writableEnded) {
+    res.write(`${JSON.stringify(event)}\n`);
+  }
 }
 
 async function run() {
@@ -131,6 +315,378 @@ async function run() {
     const db = client.db("careerpilot-db");
     const jobsCollection = db.collection("jobs");
     const messagesCollection = db.collection("messages");
+
+    const aiConversationsCollection =
+      db.collection<AIConversationDocument>("aiConversations");
+
+    await aiConversationsCollection.createIndex({
+      userId: 1,
+      updatedAt: -1,
+    });
+
+    //AI ChatBOT API
+    app.get(
+      "/ai/conversations",
+      verifyToken,
+      async (_req: Request, res: Response) => {
+        try {
+          const userId = res.locals.userId as string;
+
+          const conversations = await aiConversationsCollection
+            .find({
+              userId,
+            })
+            .sort({
+              updatedAt: -1,
+            })
+            .limit(30)
+            .toArray();
+
+          const conversationList = conversations.map((conversation) => {
+            const messages = conversation.messages || [];
+
+            const lastMessage =
+              messages.length > 0 ? messages[messages.length - 1] : null;
+
+            return {
+              _id: conversation._id.toString(),
+              title: conversation.title,
+              messageCount: messages.length,
+              lastMessage: lastMessage?.content || "",
+              createdAt: conversation.createdAt,
+              updatedAt: conversation.updatedAt,
+            };
+          });
+
+          return res.status(200).json({
+            success: true,
+            message: "AI conversations retrieved successfully.",
+            data: conversationList,
+          });
+        } catch (error) {
+          console.error("Get AI conversations error:", error);
+
+          return res.status(500).json({
+            success: false,
+            message: "Unable to retrieve AI conversations.",
+          });
+        }
+      },
+    );
+
+    app.get(
+      "/ai/conversations/:id",
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const conversationId = req.params.id as string;
+
+          const userId = res.locals.userId as string;
+
+          if (!conversationId || !ObjectId.isValid(conversationId)) {
+            return res.status(404).json({
+              success: false,
+              message: "Conversation not found.",
+            });
+          }
+
+          const conversation = await aiConversationsCollection.findOne({
+            _id: new ObjectId(conversationId),
+            userId,
+          });
+
+          if (!conversation) {
+            return res.status(404).json({
+              success: false,
+              message: "Conversation not found.",
+            });
+          }
+
+          return res.status(200).json({
+            success: true,
+            message: "AI conversation retrieved successfully.",
+            data: {
+              _id: conversation._id.toString(),
+              title: conversation.title,
+              messages: conversation.messages || [],
+              createdAt: conversation.createdAt,
+              updatedAt: conversation.updatedAt,
+            },
+          });
+        } catch (error) {
+          console.error("Get AI conversation error:", error);
+
+          return res.status(500).json({
+            success: false,
+            message: "Unable to retrieve the AI conversation.",
+          });
+        }
+      },
+    );
+
+    app.delete(
+      "/ai/conversations/:id",
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const conversationId = req.params.id as string;
+          const userId = res.locals.userId as string;
+
+          if (!conversationId || !ObjectId.isValid(conversationId)) {
+            return res.status(404).json({
+              success: false,
+              message: "Conversation not found.",
+            });
+          }
+
+          const result = await aiConversationsCollection.deleteOne({
+            _id: new ObjectId(conversationId),
+            userId,
+          });
+
+          if (result.deletedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Conversation not found.",
+            });
+          }
+
+          return res.status(200).json({
+            success: true,
+            message: "Conversation deleted successfully.",
+          });
+        } catch (error) {
+          console.error("Delete AI conversation error:", error);
+
+          return res.status(500).json({
+            success: false,
+            message: "Unable to delete the conversation.",
+          });
+        }
+      },
+    );
+
+    app.post("/ai/chat", verifyToken, async (req: Request, res: Response) => {
+      try {
+        const { conversationId, message } = req.body as AIChatInput;
+
+        const userId = res.locals.userId as string;
+
+        const normalizedMessage = message?.trim();
+
+        if (!normalizedMessage) {
+          return res.status(400).json({
+            success: false,
+            message: "A message is required.",
+          });
+        }
+
+        if (normalizedMessage.length > 2000) {
+          return res.status(400).json({
+            success: false,
+            message: "Message cannot exceed 2000 characters.",
+          });
+        }
+
+        const now = new Date();
+
+        const userMessage: AIMessageDocument = {
+          id: createAIMessageId(),
+          role: "user",
+          content: normalizedMessage,
+          createdAt: now,
+        };
+
+        let activeConversationId: ObjectId;
+
+        let conversationMessages: AIMessageDocument[] = [];
+
+        // Continue an existing conversation
+        if (conversationId) {
+          if (!ObjectId.isValid(conversationId)) {
+            return res.status(404).json({
+              success: false,
+              message: "Conversation not found.",
+            });
+          }
+
+          activeConversationId = new ObjectId(conversationId);
+
+          const conversation = await aiConversationsCollection.findOne({
+            _id: activeConversationId,
+            userId,
+          });
+
+          if (!conversation) {
+            return res.status(404).json({
+              success: false,
+              message: "Conversation not found.",
+            });
+          }
+
+          const previousMessages = conversation.messages || [];
+
+          conversationMessages = [...previousMessages, userMessage];
+
+          await aiConversationsCollection.updateOne(
+            {
+              _id: activeConversationId,
+              userId,
+            },
+            {
+              $push: {
+                messages: userMessage,
+              },
+              $set: {
+                updatedAt: now,
+              },
+            },
+          );
+        } else {
+          // Create a new conversation
+          const conversationDocument: AIConversationDocument = {
+            userId,
+            title: createConversationTitle(normalizedMessage),
+            messages: [userMessage],
+            createdAt: now,
+            updatedAt: now,
+          };
+
+          const insertResult =
+            await aiConversationsCollection.insertOne(conversationDocument);
+
+          activeConversationId = insertResult.insertedId;
+
+          conversationMessages = [userMessage];
+        }
+
+        // Streaming response headers
+        res.status(200);
+
+        res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+
+        res.setHeader("Cache-Control", "no-cache, no-transform");
+
+        res.setHeader("Connection", "keep-alive");
+
+        res.setHeader("X-Accel-Buffering", "no");
+
+        res.flushHeaders();
+
+        // Inform frontend of the active conversation ID
+        writeAIStreamEvent(res, {
+          type: "conversation",
+          conversationId: activeConversationId.toString(),
+        });
+
+        const groq = getGroqClient();
+
+        // Limit history to the latest 24 messages
+        const recentMessages = conversationMessages.slice(-24);
+
+        const groqMessages = [
+          {
+            role: "system" as const,
+            content: CAREER_PILOT_SYSTEM_PROMPT,
+          },
+          ...recentMessages.map((item) => ({
+            role: item.role,
+            content: item.content,
+          })),
+        ];
+
+        const stream = await groq.chat.completions.create({
+          model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+
+          messages: groqMessages,
+
+          temperature: 0.4,
+
+          max_completion_tokens: 1000,
+
+          stream: true,
+        });
+
+        let assistantContent = "";
+
+        for await (const chunk of stream) {
+          const content = chunk.choices[0]?.delta?.content;
+
+          if (!content) {
+            continue;
+          }
+
+          assistantContent += content;
+
+          writeAIStreamEvent(res, {
+            type: "delta",
+            content,
+          });
+        }
+
+        const normalizedAssistantContent = assistantContent.trim();
+
+        if (!normalizedAssistantContent) {
+          throw new Error("The AI provider returned an empty response.");
+        }
+
+        const assistantMessage: AIMessageDocument = {
+          id: createAIMessageId(),
+          role: "assistant",
+          content: normalizedAssistantContent,
+          createdAt: new Date(),
+        };
+
+        // Save completed assistant response
+        await aiConversationsCollection.updateOne(
+          {
+            _id: activeConversationId,
+            userId,
+          },
+          {
+            $push: {
+              messages: assistantMessage,
+            },
+            $set: {
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        writeAIStreamEvent(res, {
+          type: "done",
+          conversationId: activeConversationId.toString(),
+          suggestions: getSuggestedPrompts(normalizedMessage),
+        });
+
+        res.end();
+      } catch (error) {
+        console.error("AI chat error:", error);
+
+        const errorMessage =
+          error instanceof Error
+            ? error.message
+            : "Unable to generate an AI response.";
+
+        // Streaming already শুরু হয়ে গেলে JSON response পাঠানো যাবে না
+        if (res.headersSent) {
+          writeAIStreamEvent(res, {
+            type: "error",
+            message: errorMessage,
+          });
+
+          res.end();
+          return;
+        }
+
+        return res.status(500).json({
+          success: false,
+          message: "Unable to generate an AI response.",
+        });
+      }
+    });
+
+    // ALL Public API
 
     app.get("/jobs", async (req: Request, res: Response) => {
       try {
