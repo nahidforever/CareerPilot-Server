@@ -1,7 +1,7 @@
 import express, { Application, NextFunction, Request, Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { MongoClient, ServerApiVersion } from "mongodb";
+import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose-cjs";
 
 dotenv.config();
@@ -119,6 +119,7 @@ async function run() {
     const db = client.db("careerpilot-db");
     const jobsCollection = db.collection("jobs");
 
+    // Protected API
     app.post(
       "/manage/jobs",
       verifyToken,
@@ -240,6 +241,216 @@ async function run() {
           return res.status(500).json({
             success: false,
             message: "Unable to publish the job.",
+          });
+        }
+      },
+    );
+
+    app.get(
+      "/manage/jobs/my-jobs",
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const jobs = await jobsCollection
+            .find({
+              createdBy: res.locals.userId,
+            })
+            .sort({
+              createdAt: -1,
+            })
+            .toArray();
+
+          return res.status(200).json({
+            success: true,
+            message: "Jobs retrieved successfully.",
+            data: jobs,
+          });
+        } catch (error) {
+          console.error("Get user jobs error:", error);
+
+          return res.status(500).json({
+            success: false,
+            message: "Unable to retrieve your jobs.",
+          });
+        }
+      },
+    );
+
+    app.patch("/manage/jobs/:id", verifyToken, async (req: Request, res: Response) => {
+      try {
+        const jobId = req.params.id as string;
+
+        if (!jobId || !ObjectId.isValid(jobId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid job ID.",
+          });
+        }
+
+        const {
+          title,
+          companyName,
+          companyLogo,
+          shortDescription,
+          fullDescription,
+          category,
+          jobType,
+          workMode,
+          location,
+          experienceLevel,
+          salaryMin,
+          salaryMax,
+          applicationDeadline,
+          skills,
+        } = req.body as JobInput;
+
+        if (
+          !title?.trim() ||
+          !companyName?.trim() ||
+          !shortDescription?.trim() ||
+          !fullDescription?.trim() ||
+          !category?.trim() ||
+          !jobType?.trim() ||
+          !workMode?.trim() ||
+          !location?.trim() ||
+          !experienceLevel?.trim() ||
+          !applicationDeadline
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: "Please provide all required job information.",
+          });
+        }
+
+        const minimumSalary = Number(salaryMin);
+        const maximumSalary = Number(salaryMax);
+
+        if (
+          !Number.isFinite(minimumSalary) ||
+          !Number.isFinite(maximumSalary) ||
+          minimumSalary < 0 ||
+          maximumSalary < 0
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: "Please provide valid salary values.",
+          });
+        }
+
+        if (minimumSalary > maximumSalary) {
+          return res.status(400).json({
+            success: false,
+            message: "Minimum salary cannot exceed maximum salary.",
+          });
+        }
+
+        const deadline = new Date(applicationDeadline);
+
+        if (Number.isNaN(deadline.getTime())) {
+          return res.status(400).json({
+            success: false,
+            message: "Please provide a valid application deadline.",
+          });
+        }
+
+        const normalizedSkills = Array.isArray(skills)
+          ? skills.map((skill) => String(skill).trim()).filter(Boolean)
+          : [];
+
+        if (normalizedSkills.length === 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Please provide at least one required skill.",
+          });
+        }
+
+        const updatedJob = await jobsCollection.findOneAndUpdate(
+          {
+            _id: new ObjectId(jobId),
+            createdBy: res.locals.userId,
+          },
+          {
+            $set: {
+              title: title.trim(),
+              companyName: companyName.trim(),
+              companyLogo: companyLogo?.trim() || null,
+              shortDescription: shortDescription.trim(),
+              fullDescription: fullDescription.trim(),
+              category: category.trim(),
+              jobType: jobType.trim(),
+              workMode: workMode.trim(),
+              location: location.trim(),
+              experienceLevel: experienceLevel.trim(),
+              salaryMin: minimumSalary,
+              salaryMax: maximumSalary,
+              applicationDeadline: deadline,
+              skills: normalizedSkills,
+              updatedAt: new Date(),
+            },
+          },
+          {
+            returnDocument: "after",
+          },
+        );
+
+        if (!updatedJob) {
+          return res.status(404).json({
+            success: false,
+            message: "Job not found or you cannot edit this job.",
+          });
+        }
+
+        return res.status(200).json({
+          success: true,
+          message: "Job updated successfully.",
+          data: updatedJob,
+        });
+      } catch (error) {
+        console.error("Update job error:", error);
+
+        return res.status(500).json({
+          success: false,
+          message: "Unable to update the job.",
+        });
+      }
+    });
+
+    app.delete(
+      "/manage/jobs/:id",
+      verifyToken,
+      async (req: Request, res: Response) => {
+        try {
+          const jobId = req.params.id as string;
+
+          if (!jobId || !ObjectId.isValid(jobId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid job ID.",
+            });
+          }
+
+          const result = await jobsCollection.deleteOne({
+            _id: new ObjectId(jobId),
+            createdBy: res.locals.userId,
+          });
+
+          if (result.deletedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Job not found or you cannot delete this job.",
+            });
+          }
+
+          return res.status(200).json({
+            success: true,
+            message: "Job deleted successfully.",
+          });
+        } catch (error) {
+          console.error("Delete job error:", error);
+
+          return res.status(500).json({
+            success: false,
+            message: "Unable to delete the job.",
           });
         }
       },
