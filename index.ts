@@ -310,7 +310,7 @@ function writeAIStreamEvent(res: Response, event: AIStreamEvent) {
 
 async function run() {
   try {
-    await client.connect();
+    // await client.connect();
 
     const db = client.db("careerpilot-db");
     const jobsCollection = db.collection("jobs");
@@ -319,10 +319,14 @@ async function run() {
     const aiConversationsCollection =
       db.collection<AIConversationDocument>("aiConversations");
 
-    await aiConversationsCollection.createIndex({
-      userId: 1,
-      updatedAt: -1,
-    });
+    void aiConversationsCollection
+      .createIndex({
+        userId: 1,
+        updatedAt: -1,
+      })
+      .catch((error) => {
+        console.error("AI conversation index creation error:", error);
+      });
 
     //AI ChatBOT API
     app.get(
@@ -1358,7 +1362,7 @@ async function run() {
       },
     );
 
-    await client.db("admin").command({ ping: 1 });
+    // await client.db("admin").command({ ping: 1 });
 
     console.log(
       "Pinged your deployment. You successfully connected to MongoDB!",
