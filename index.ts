@@ -2,7 +2,7 @@ import express, { Application, NextFunction, Request, Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
-import type { Document, Filter, Sort } from "mongodb";
+import type { Document, Filter } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose-cjs";
 import Groq from "groq-sdk";
 
@@ -24,15 +24,68 @@ app.use(
 
 app.use(express.json());
 
-// MongoDB Client
+// MongoDB reusable connection
 
-const client = new MongoClient(uri, {
+const mongoClientOptions = {
   serverApi: {
     version: ServerApiVersion.v1,
     strict: true,
     deprecationErrors: true,
   },
-});
+  maxPoolSize: 10,
+  minPoolSize: 0,
+  maxIdleTimeMS: 30_000,
+};
+
+let mongoClient: MongoClient | null = null;
+
+let mongoClientPromise: Promise<MongoClient> | null = null;
+
+function resetMongoClient(clientToReset?: MongoClient) {
+  if (!clientToReset || mongoClient === clientToReset) {
+    mongoClient = null;
+    mongoClientPromise = null;
+  }
+}
+
+function createMongoClient() {
+  const newClient = new MongoClient(uri, mongoClientOptions);
+
+  newClient.on("topologyClosed", () => {
+    resetMongoClient(newClient);
+  });
+
+  return newClient;
+}
+
+async function getMongoClient(): Promise<MongoClient> {
+  if (!mongoClient) {
+    mongoClient = createMongoClient();
+  }
+
+  if (!mongoClientPromise) {
+    const currentClient = mongoClient;
+
+    mongoClientPromise = currentClient
+      .connect()
+      .then(() => currentClient)
+      .catch((error) => {
+        resetMongoClient(currentClient);
+
+        throw error;
+      });
+  }
+
+  return mongoClientPromise;
+}
+
+async function getDatabase() {
+  const connectedClient = await getMongoClient();
+
+  return connectedClient.db("careerpilot-db");
+}
+
+// Better Auth JWKS
 
 const JWKS = createRemoteJWKSet(
   new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
@@ -310,30 +363,18 @@ function writeAIStreamEvent(res: Response, event: AIStreamEvent) {
 
 async function run() {
   try {
-    // await client.connect();
+    // AI conversations list
 
-    const db = client.db("careerpilot-db");
-    const jobsCollection = db.collection("jobs");
-    const messagesCollection = db.collection("messages");
-
-    const aiConversationsCollection =
-      db.collection<AIConversationDocument>("aiConversations");
-
-    void aiConversationsCollection
-      .createIndex({
-        userId: 1,
-        updatedAt: -1,
-      })
-      .catch((error) => {
-        console.error("AI conversation index creation error:", error);
-      });
-
-    //AI ChatBOT API
     app.get(
       "/ai/conversations",
       verifyToken,
       async (_req: Request, res: Response) => {
         try {
+          const db = await getDatabase();
+
+          const aiConversationsCollection =
+            db.collection<AIConversationDocument>("aiConversations");
+
           const userId = res.locals.userId as string;
 
           const conversations = await aiConversationsCollection
@@ -353,7 +394,7 @@ async function run() {
               messages.length > 0 ? messages[messages.length - 1] : null;
 
             return {
-              _id: conversation._id.toString(),
+              _id: conversation._id?.toString(),
               title: conversation.title,
               messageCount: messages.length,
               lastMessage: lastMessage?.content || "",
@@ -378,11 +419,18 @@ async function run() {
       },
     );
 
+    // Single AI conversation
+
     app.get(
       "/ai/conversations/:id",
       verifyToken,
       async (req: Request, res: Response) => {
         try {
+          const db = await getDatabase();
+
+          const aiConversationsCollection =
+            db.collection<AIConversationDocument>("aiConversations");
+
           const conversationId = req.params.id as string;
 
           const userId = res.locals.userId as string;
@@ -410,7 +458,7 @@ async function run() {
             success: true,
             message: "AI conversation retrieved successfully.",
             data: {
-              _id: conversation._id.toString(),
+              _id: conversation._id?.toString(),
               title: conversation.title,
               messages: conversation.messages || [],
               createdAt: conversation.createdAt,
@@ -428,12 +476,20 @@ async function run() {
       },
     );
 
+    // Delete AI conversation
+
     app.delete(
       "/ai/conversations/:id",
       verifyToken,
       async (req: Request, res: Response) => {
         try {
+          const db = await getDatabase();
+
+          const aiConversationsCollection =
+            db.collection<AIConversationDocument>("aiConversations");
+
           const conversationId = req.params.id as string;
+
           const userId = res.locals.userId as string;
 
           if (!conversationId || !ObjectId.isValid(conversationId)) {
@@ -470,8 +526,15 @@ async function run() {
       },
     );
 
+    // AI chat streaming
+
     app.post("/ai/chat", verifyToken, async (req: Request, res: Response) => {
       try {
+        const db = await getDatabase();
+
+        const aiConversationsCollection =
+          db.collection<AIConversationDocument>("aiConversations");
+
         const { conversationId, message } = req.body as AIChatInput;
 
         const userId = res.locals.userId as string;
@@ -505,7 +568,6 @@ async function run() {
 
         let conversationMessages: AIMessageDocument[] = [];
 
-        // Continue an existing conversation
         if (conversationId) {
           if (!ObjectId.isValid(conversationId)) {
             return res.status(404).json({
@@ -547,7 +609,6 @@ async function run() {
             },
           );
         } else {
-          // Create a new conversation
           const conversationDocument: AIConversationDocument = {
             userId,
             title: createConversationTitle(normalizedMessage),
@@ -564,7 +625,6 @@ async function run() {
           conversationMessages = [userMessage];
         }
 
-        // Streaming response headers
         res.status(200);
 
         res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
@@ -577,7 +637,6 @@ async function run() {
 
         res.flushHeaders();
 
-        // Inform frontend of the active conversation ID
         writeAIStreamEvent(res, {
           type: "conversation",
           conversationId: activeConversationId.toString(),
@@ -585,7 +644,6 @@ async function run() {
 
         const groq = getGroqClient();
 
-        // Limit history to the latest 24 messages
         const recentMessages = conversationMessages.slice(-24);
 
         const groqMessages = [
@@ -601,13 +659,9 @@ async function run() {
 
         const stream = await groq.chat.completions.create({
           model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
-
           messages: groqMessages,
-
           temperature: 0.4,
-
           max_completion_tokens: 1000,
-
           stream: true,
         });
 
@@ -641,7 +695,6 @@ async function run() {
           createdAt: new Date(),
         };
 
-        // Save completed assistant response
         await aiConversationsCollection.updateOne(
           {
             _id: activeConversationId,
@@ -672,7 +725,6 @@ async function run() {
             ? error.message
             : "Unable to generate an AI response.";
 
-        // Streaming already শুরু হয়ে গেলে JSON response পাঠানো যাবে না
         if (res.headersSent) {
           writeAIStreamEvent(res, {
             type: "error",
@@ -690,10 +742,14 @@ async function run() {
       }
     });
 
-    // ALL Public API
+    // Public jobs
 
     app.get("/jobs", async (req: Request, res: Response) => {
       try {
+        const db = await getDatabase();
+
+        const jobsCollection = db.collection("jobs");
+
         const search =
           typeof req.query.search === "string" ? req.query.search.trim() : "";
 
@@ -743,7 +799,6 @@ async function run() {
 
         const query: Filter<Document> = {};
 
-        // Search by title, company, description or skills
         if (search) {
           const safeSearch = escapeRegex(search);
 
@@ -775,17 +830,14 @@ async function run() {
           ];
         }
 
-        // Exact category filter
         if (category) {
           query.category = category;
         }
 
-        // Exact job type filter
         if (jobType) {
           query.jobType = jobType;
         }
 
-        // Location text filter
         if (location) {
           query.location = {
             $regex: escapeRegex(location),
@@ -793,7 +845,6 @@ async function run() {
           };
         }
 
-        // Salary range filters
         if (Number.isFinite(minSalary) && minSalary >= 0) {
           query.salaryMax = {
             $gte: minSalary,
@@ -880,10 +931,14 @@ async function run() {
       }
     });
 
-    // Public single job details API
+    // Public job details
 
     app.get("/jobs/:id", async (req: Request, res: Response) => {
       try {
+        const db = await getDatabase();
+
+        const jobsCollection = db.collection("jobs");
+
         const jobId = req.params.id as string;
 
         if (!jobId || !ObjectId.isValid(jobId)) {
@@ -937,8 +992,14 @@ async function run() {
       }
     });
 
+    // Contact messages
+
     app.post("/messages", async (req: Request, res: Response) => {
       try {
+        const db = await getDatabase();
+
+        const messagesCollection = db.collection("messages");
+
         const { name, email, subject, message } =
           req.body as ContactMessageInput;
 
@@ -1024,12 +1085,17 @@ async function run() {
       }
     });
 
-    // Protected API
+    // Add job
+
     app.post(
       "/manage/jobs",
       verifyToken,
       async (req: Request, res: Response) => {
         try {
+          const db = await getDatabase();
+
+          const jobsCollection = db.collection("jobs");
+
           const {
             title,
             companyName,
@@ -1066,6 +1132,7 @@ async function run() {
           }
 
           const minimumSalary = Number(salaryMin);
+
           const maximumSalary = Number(salaryMax);
 
           if (
@@ -1148,11 +1215,17 @@ async function run() {
       },
     );
 
+    // Current user's jobs
+
     app.get(
       "/manage/jobs/my-jobs",
       verifyToken,
-      async (req: Request, res: Response) => {
+      async (_req: Request, res: Response) => {
         try {
+          const db = await getDatabase();
+
+          const jobsCollection = db.collection("jobs");
+
           const jobs = await jobsCollection
             .find({
               createdBy: res.locals.userId,
@@ -1178,11 +1251,17 @@ async function run() {
       },
     );
 
+    // Update job
+
     app.patch(
       "/manage/jobs/:id",
       verifyToken,
       async (req: Request, res: Response) => {
         try {
+          const db = await getDatabase();
+
+          const jobsCollection = db.collection("jobs");
+
           const jobId = req.params.id as string;
 
           if (!jobId || !ObjectId.isValid(jobId)) {
@@ -1228,6 +1307,7 @@ async function run() {
           }
 
           const minimumSalary = Number(salaryMin);
+
           const maximumSalary = Number(salaryMax);
 
           if (
@@ -1321,11 +1401,17 @@ async function run() {
       },
     );
 
+    // Delete job
+
     app.delete(
       "/manage/jobs/:id",
       verifyToken,
       async (req: Request, res: Response) => {
         try {
+          const db = await getDatabase();
+
+          const jobsCollection = db.collection("jobs");
+
           const jobId = req.params.id as string;
 
           if (!jobId || !ObjectId.isValid(jobId)) {
@@ -1362,25 +1448,23 @@ async function run() {
       },
     );
 
-    // await client.db("admin").command({ ping: 1 });
-
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!",
-    );
+    console.log("CareerPilot API routes registered successfully.");
   } finally {
-    // Server চলাকালীন MongoDB connection বন্ধ করব না
-    // await client.close();
+    // Shared MongoDB client close korbo na.
   }
 }
 
-run().catch(console.dir);
+run().catch((error) => {
+  console.error("Server initialization error:", error);
+});
 
 app.get("/", (_req: Request, res: Response) => {
   res.send("CareerPilot Server is Running...");
 });
 
-// Listen
+// Existing listen structure
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
+
