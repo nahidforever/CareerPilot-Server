@@ -658,7 +658,7 @@ async function run() {
         ];
 
         const stream = await groq.chat.completions.create({
-          model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+          model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
           messages: groqMessages,
           temperature: 0.4,
           max_completion_tokens: 1000,
@@ -1467,4 +1467,3 @@ app.get("/", (_req: Request, res: Response) => {
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
-
